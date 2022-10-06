@@ -52,6 +52,7 @@ class TransportBuilder(object):
         self.ystep = None
         self.ygrid = None
         self.x = None
+        self.warmup_factor = 1.0
         
     def get_logcmu(self):
         if self.x is None:
@@ -108,6 +109,9 @@ class TransportBuilder(object):
         self.reduced_diffusion_coefficients = torch.tensor(self.reduced_diffusion_coefficients,
                                                            dtype=torch.float)
         self.reduced_diffusion_coefficients /=self.kinematic_viscosity
+        self.mean_diffusion_coefficients = np.median(self.reduced_diffusion_coefficients)
+        self.water_reaction_index = [i for i, reac in enumerate(self.eqsys.reactions)
+                                     if is_water_reaction(reac)]
         
     def change_temperature(self, TK : float):
         self.TK = TK
@@ -150,7 +154,8 @@ class TransportBuilder(object):
         base = base[..., None]
         return base
     
-    def transport_residual(self, logc : torch.Tensor):
+    def transport_residual(self, logc : Optional[torch.Tensor],
+                           c : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T #(nsolutes, ngrid)
@@ -158,7 +163,7 @@ class TransportBuilder(object):
         loga = logg + logc #(nsolutes, ngrid)
         ypoints = self.ypoints #(npoints,)
         ystep = self.ystep
-        mdiffs = self.reduced_diffusion_coefficients[..., None] #(nsolutes, 1)
+        mdiffs = self.get_reduced_diffusion_coefficients() #(nsolutes, 1)
         tdiffs = self.wall_diffusion_plus(ypoints)[1:-1] #(ngrid-1,)
         A = self.reduced_formula_matrix #(nels, nsolutes)
         C = self.closure_matrix #(nnoncon-nreac, nsolutes)
@@ -184,6 +189,7 @@ class TransportBuilder(object):
         else:
             logsatur = R@logaleft - logKsp #(nreac, 1)
             jsatur = -self.kreaction*torch.relu(torch.exp(logsatur) - 1) #(nreac, 1) #(mol/m3)
+            #jsatur = -self.kreaction*logsatur
             jend = A@(R.T)@jsatur #(nels, 1)
             left_residual = (jend - jleft)/ystep #(nels, 1)
         residual = torch.cat([left_residual, middle_residual, right_residual], dim=1) #(nsolutes, ngrid)
@@ -199,7 +205,7 @@ class TransportBuilder(object):
         loga = logg + logc #(nsolutes, ngrid)
         ypoints = self.ypoints #(npoints,)
         ystep = self.ystep
-        mdiffs = self.reduced_diffusion_coefficients[..., None] #(nsolutes, 1)
+        mdiffs = self.get_reduced_diffusion_coefficients() #(nsolutes, 1)
         tdiffs = self.wall_diffusion_plus(ypoints)[1:-1] #(ngrid-1,)
         A = self.reduced_formula_matrix #(nels, nsolutes)
         R = self.reduced_reaction_vector #(nreac, nsolutes)
@@ -230,14 +236,20 @@ class TransportBuilder(object):
         mu0 = self.reduced_standard_potentials[..., None]
         return mu - (mu0 + loga)
     
-    def lma_residual(self, logc : torch.Tensor):
+    def lma_residual(self, logc : torch.Tensor, only_water : bool = False):
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
         loga = logg + logc
-        res = self.reduced_stoich_matrix@loga - self.logk[..., None]
+        if only_water:
+            nu = self.reduced_stoich_matrix[self.water_reaction_index, :]
+            logK = self.logk[self.water_reaction_index]
+        else:
+            nu = self.reduced_stoich_matrix
+            logK = self.logk
+        res = nu@loga - logK[..., None]
         return res
     
     def full_residual(self, logcmu : torch.Tensor, lma : bool = True,
-                      include_mu : bool = False):
+                      include_mu : bool = False, include_water : bool = True):
         #logcmu : (2*nsolutes, ngrid)
         if include_mu:
             n = logcmu.shape[0]
@@ -245,18 +257,18 @@ class TransportBuilder(object):
             mu = logcmu[n//2:, :]
         else:
             logc = logcmu
-        #residual_factor = 1/max(self.cbulk.values())*1/self.flux_residual_tol
+        residual_factor = 1/self.flux_residual_tol
         res1 = self.transport_residual(logc) #(nels, ngrid)
-        #res1 *= residual_factor
+        res1 *= residual_factor
         if include_mu:
             res3 = self.potential_residual(logc, mu) #(nsolutes, ngrid)
-        if lma:
-            res2 = self.lma_residual(logc)
-        if include_mu and lma:
+        if lma or include_water:
+            res2 = self.lma_residual(logc, only_water=not lma)
+        if include_mu and (lma or include_water):
             res = torch.cat([res1, res2, res3], dim=0)
-        elif not include_mu and lma:
+        elif not include_mu and (lma or include_water):
             res = torch.cat([res1, res2], dim=0)
-        elif include_mu and not lma:
+        elif include_mu and not (lma or include_water):
             res = torch.cat([res1, res3], dim=0) #(nels + nreac, ngrid)
         else:
             res = res1
@@ -293,7 +305,7 @@ class TransportBuilder(object):
         if not include_mu:
             self.x = logc.flatten()
             lambd0 = 1/max(self.cbulk.values())
-            lambd_ = torch.zeros([len(self.cbulk) + 1, self.ngrid]) + lambd0
+            lambd_ = torch.zeros([len(self.cbulk) + 2, self.ngrid]) + lambd0
             self.lambd = lambd_.flatten()
         else:
             logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
@@ -314,7 +326,7 @@ class TransportBuilder(object):
         x = self.x
         lambd_ = self.lambd
         logc = x.reshape([self.nspecies, self.ngrid])
-        lambd = lambd_.reshape([len(self.cbulk) + 1, self.ngrid])
+        lambd = lambd_.reshape([len(self.cbulk) + 2, self.ngrid])
         self.make_grid(oldngrid, self.ymax)
         logc = torch_linspace(logc[:, 0], logc[:, 1], self.ngrid).T
         lambd = torch_linspace(lambd[:, 0], lambd[:, 1], self.ngrid).T
@@ -323,7 +335,8 @@ class TransportBuilder(object):
         return solgem
         
     def solve_gem_lagrangian(self, simplified : bool = False,
-                             method='lm'):
+                             method='lm', options=None):
+        options = dict() if options is None else options
         self.simplified = simplified
         def flat_residual(x):
             logcmu = x.reshape([self.nspecies, self.ngrid])
@@ -336,48 +349,38 @@ class TransportBuilder(object):
             return res.flatten()[0]
         f_t = flat_objective
         df_t = functorch.jacrev(f_t)
-        d2f_t = functorch.hessian(f_t)
         g_t = flat_residual
         dg_t = functorch.jacrev(g_t)
-        d2g_t = functorch.jacrev(lambda x, v : (dg_t(x).T)@v)
-        f = torch_wrap(f_t)
         df = torch_wrap(df_t)
-        d2f = torch_wrap(d2f_t)
-        g = torch_wrap(g_t)
         dg = torch_wrap(dg_t)
-        d2g = torch_wrap(d2g_t)
-        h, dh = make_lagrangian_residual_jacobian(g, df, dg, d2f, d2g, 
-                                                  len(self.x),
-                                                  len(self.lambd))
         x0 = self.x.detach().numpy()
         blambd = df(x0)
         Alambd = dg(x0).T
         lambd0, _, _, _ = np.linalg.lstsq(Alambd, blambd, rcond=None)
         xlambd0 = np.concatenate([x0, lambd0], axis=0)
-        if method != "newton":
-            sol = scipy.optimize.root(h, xlambd0, jac=dh, method="lm")
-            x, lambd = sol.x[:len(self.x)], sol.x[len(self.x):]
-        else:
-            maxiter = 1000
-            tol = 1e-6
-            for i in range(maxiter):
-                A = dh(xlambd0)
-                b = -h(xlambd0)
-                dx = np.linalg.solve(A, b)
-                xlambd0 += dx
-                delta = np.max(np.abs(dx))
-                if delta < tol:
-                    break
-            sol = {'iter':i, 'delta':delta, 'fun':b, 'x':xlambd0}
-            x, lambd = xlambd0[:len(self.x)], xlambd0[len(self.x):]
+        h_t = make_lagrangian_residual_torch(g_t,
+                                             df_t,
+                                             dg_t,
+                                             len(self.x),
+                                             len(self.lambd))
+        loss_t = lambda x : torch.sum(h_t(x)**2)
+        dloss_t = functorch.grad(loss_t)
+        d2loss_t = functorch.hessian(loss_t)
+        loss = torch_wrap(loss_t)
+        dloss = torch_wrap(dloss_t)
+        d2loss = torch_wrap(d2loss_t)
+        sol = scipy.optimize.minimize(loss, xlambd0, jac=dloss, method='TNC',
+                                      hess=d2loss) #TNC
+        xlambd0 = sol.x
+        sol = scipy.optimize.minimize(loss, xlambd0, jac=dloss, method='trust-constr',
+                                      hess=d2loss, options=options) #TNC
+        x, lambd = sol.x[:len(self.x)], sol.x[len(self.x):]
         x = torch.tensor(x, dtype=torch.float)
         lambd = torch.tensor(lambd, dtype=torch.float)
         self.x = x
         self.lambd = lambd
         return sol
         
-#    def solve_gem_sgd(self, simplified : bool = False,
-#                      optimize)
     def solve_lma(self, simplified : bool = False):
         self.simplified = simplified
         def flat_residual(x):
@@ -392,39 +395,12 @@ class TransportBuilder(object):
         self.x = x
         return sol
     
-    def solve_gem(self, simplified : bool = False,
-                  lr : float = 1e-3,
-                  c : float = 10000,
-                  delta : float = 1e-3,
-                  p : int = 2,
-                  tol : float = 1e-6,
-                  maxiter : int = 10000):
-        self.simplified = simplified
-        def flat_residual(x):
-            logcmu = x.reshape([self.nspecies, self.ngrid])
-            res = self.full_residual(logcmu, lma=False, include_mu=False)
-            return res.flatten()
-        def flat_objective(x):
-            logcmu = x.reshape([self.nspecies, self.ngrid])
-            res = self.gibbs_free_energy(logcmu)
-            return res.flatten()[0]
-        x0 = self.x.detach()
-        x0.requires_grad = True
-        optimizer = torch.optim.SGD([x0], lr=lr)
-        for i in range(maxiter):
-            optimizer.zero_grad()
-            x0_ = x0.detach().clone()
-            f1 = flat_objective(x0)
-            f2 = (torch.sum(torch.abs(flat_residual(x0)/delta)**p))
-            f = f1 + c*f2
-            f.backward()
-            optimizer.step()
-            delta = (x0_ - x0.detach()).sum()
-            if delta < tol:
-                break
-        x0.requires_grad = False
-        self.x = x0
-        
+    def get_reduced_diffusion_coefficients(self):
+        d0 = self.mean_diffusion_coefficients
+        d1 = self.reduced_diffusion_coefficients
+        d = (1 - self.warmup_factor)*d0 + self.warmup_factor*d1
+        return d[..., None]
+    
     @property
     def xlambd(self):
         return torch.cat([self.x, self.lambd], dim=0)
@@ -460,7 +436,7 @@ def make_lagrangian_residual_jacobian(g, df, dg, d2f, d2g, nx, nlambd):
     return residual, jacobian
 
 
-def make_lagrangian_residual_torch(g, df, dg, d2f, d2g, nx, nlambd):
+def make_lagrangian_residual_torch(g, df, dg, nx, nlambd):
     def residual(xlambd):
         x, lambd = xlambd[..., :nx], xlambd[..., nx:]
         res1 = df(x) - (dg(x).T)@lambd
@@ -476,6 +452,10 @@ def torch_wrap(f):
         res = f(*args).detach().numpy()
         return res
     return g
+
+
+def is_water_reaction(reac):
+    return 'H2O' in reac and 'OH-' in reac and 'H+' in reac
 
 
 @torch.jit.script
