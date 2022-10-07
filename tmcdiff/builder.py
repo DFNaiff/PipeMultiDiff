@@ -54,20 +54,9 @@ class TransportBuilder(object):
         self.x = None
         self.warmup_factor = 1.0
         
-    def get_logcmu(self):
-        if self.x is None:
-            return None, None
-        elif self.x.numel() == self.ngrid*self.nspecies:
-            logc = self.x.reshape(self.nspecies, self.ngrid)
-            mu = None
-            return logc, mu
-        elif self.x.numel() == 2*self.ngrid*self.nspecies:
-            logcmu = self.x.reshape(2*self.nspecies, self.ngrid)
-            logc = logcmu[:self.nspecies, :]
-            mu = logcmu[self.nspecies:, :]
-            return logc, mu
-        else:
-            raise ValueError
+    def get_logc(self):
+        logc = self.x.reshape(self.nspecies, self.ngrid)
+        return logc
 
     def set_species(self, species_to_remove : Optional[List[str]] = None):
         if species_to_remove is not None:
@@ -154,12 +143,16 @@ class TransportBuilder(object):
         base = base[..., None]
         return base
     
-    def transport_residual(self, logc : Optional[torch.Tensor],
+    def transport_residual(self, logc : Optional[torch.Tensor] = None,
                            c : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
+        assert (c is not None or logc is not None)
+        if c is None:
+            c = torch.exp(logc) #(nsolutes, ngrid)
+        else:
+            logc = torch.log(c)
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T #(nsolutes, ngrid)
-        c = torch.exp(logc) #(nsolutes, ngrid)
         loga = logg + logc #(nsolutes, ngrid)
         ypoints = self.ypoints #(npoints,)
         ystep = self.ystep
@@ -195,13 +188,18 @@ class TransportBuilder(object):
         residual = torch.cat([left_residual, middle_residual, right_residual], dim=1) #(nsolutes, ngrid)
         return residual
     
-    def fluxes(self, logc : Optional[torch.Tensor] = None):
+    def fluxes(self, logc : Optional[torch.Tensor] = None,
+               c : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
-        if logc is None:
-            logc = self.get_logcmu()[0]
+        if logc is None and c is None:
+            logc = self.get_logc()
+        assert (c is not None or logc is not None)
+        if c is None:
+            c = torch.exp(logc) #(nsolutes, ngrid)
+        else:
+            logc = torch.log(c)
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T #(nsolutes, ngrid)
-        c = torch.exp(logc) #(nsolutes, ngrid)
         loga = logg + logc #(nsolutes, ngrid)
         ypoints = self.ypoints #(npoints,)
         ystep = self.ystep
@@ -228,15 +226,15 @@ class TransportBuilder(object):
         jfull *= self.kinematic_viscosity/self.wall_length() #mol/m3 to mol/(m2*s)
         return jfull
         
-    def potential_residual(self, logc : torch.Tensor, mu : torch.Tensor):
-        #logc : (nsolutes, ngrid)
-        #mu : (nsolutes, ngrid)
-        logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
-        loga = logg + logc
-        mu0 = self.reduced_standard_potentials[..., None]
-        return mu - (mu0 + loga)
     
-    def lma_residual(self, logc : torch.Tensor, only_water : bool = False):
+    def lma_residual(self, logc : torch.Tensor = None, 
+                     c : Optional[torch.Tensor] = None,
+                     only_water : bool = False):
+        assert (c is not None or logc is not None)
+        if c is None:
+            c = torch.exp(logc) #(nsolutes, ngrid)
+        else:
+            logc = torch.log(c)
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
         loga = logg + logc
         if only_water:
@@ -248,41 +246,29 @@ class TransportBuilder(object):
         res = nu@loga - logK[..., None]
         return res
     
-    def full_residual(self, logcmu : torch.Tensor, lma : bool = True,
-                      include_mu : bool = False, include_water : bool = True):
-        #logcmu : (2*nsolutes, ngrid)
-        if include_mu:
-            n = logcmu.shape[0]
-            logc = logcmu[:n//2, :]
-            mu = logcmu[n//2:, :]
-        else:
-            logc = logcmu
+    def full_residual(self, logc : Optional[torch.Tensor] = None,
+                      c : Optional[torch.Tensor] = None,
+                      lma : bool = True,
+                      include_water : bool = True):
+        #logc : (2*nsolutes, ngrid)
         residual_factor = 1/self.flux_residual_tol
-        res1 = self.transport_residual(logc) #(nels, ngrid)
+        res1 = self.transport_residual(logc, c) #(nels, ngrid)
         res1 *= residual_factor
-        if include_mu:
-            res3 = self.potential_residual(logc, mu) #(nsolutes, ngrid)
         if lma or include_water:
-            res2 = self.lma_residual(logc, only_water=not lma)
-        if include_mu and (lma or include_water):
-            res = torch.cat([res1, res2, res3], dim=0)
-        elif not include_mu and (lma or include_water):
+            res2 = self.lma_residual(logc, c, only_water=not lma)
             res = torch.cat([res1, res2], dim=0)
-        elif include_mu and not (lma or include_water):
-            res = torch.cat([res1, res3], dim=0) #(nels + nreac, ngrid)
         else:
             res = res1
         return res
 
-    def gibbs_free_energy(self, logcmu, include_mu=False):
-        if include_mu:
-            n = logcmu.shape[0]
-            logc = logcmu[:n//2, :]
-            mu = logcmu[n//2:, :]
-            c = torch.exp(logc)
+    def gibbs_free_energy(self, logc : Optional[torch.Tensor] = None,
+                          c : Optional[torch.Tensor] = None):
+        assert (c is not None or logc is not None)
+        if c is None:
+            c = torch.exp(logc) #(nsolutes, ngrid)
         else:
-            mu = self.chemical_potentials(logcmu)
-            c = torch.exp(logcmu)
+            logc = torch.log(c)
+        mu = self.chemical_potentials(logc)
         return torch.mean(torch.sum(c*mu, dim=0))
     
     def chemical_potentials(self, logc):
@@ -292,7 +278,7 @@ class TransportBuilder(object):
         mu = mu0 + loga
         return mu
 
-    def set_initial_guess_from_bulk(self, include_mu : bool = False):
+    def set_initial_guess_from_bulk(self):
         eqsysbulk = pyequion2.EquilibriumSystem(self.eqsys.solute_elements,
                                                 activity_model=self.eqsys.activity_model,
                                                 from_elements=True)
@@ -302,18 +288,10 @@ class TransportBuilder(object):
         logcvector = [np.log(bulk_molals[spec]) for spec in self.species]
         logcvector = torch.tensor(logcvector, dtype=torch.float)[:, None]
         logc = torch.zeros([self.nspecies, self.ngrid]) + logcvector
-        if not include_mu:
-            self.x = logc.flatten()
-            lambd0 = 1/max(self.cbulk.values())
-            lambd_ = torch.zeros([len(self.cbulk) + 2, self.ngrid]) + lambd0
-            self.lambd = lambd_.flatten()
-        else:
-            logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
-            loga = logg + logc
-            mu0 = self.reduced_standard_potentials[..., None]
-            mu = mu0 + loga
-            logcmu = torch.cat([logc, mu], dim=0)
-            self.x = logcmu.flatten()
+        self.x = logc.flatten()
+        lambd0 = 1/max(self.cbulk.values())
+        lambd_ = torch.zeros([len(self.cbulk) + 2, self.ngrid]) + lambd0
+        self.lambd = lambd_.flatten()
         
     def set_initial_guess_lagrangian(self, method='lm'):
         raise NotImplementedError
@@ -339,13 +317,13 @@ class TransportBuilder(object):
         options = dict() if options is None else options
         self.simplified = simplified
         def flat_residual(x):
-            logcmu = x.reshape([self.nspecies, self.ngrid])
-            res = self.full_residual(logcmu, lma=False, include_mu=False)
+            logc = x.reshape([self.nspecies, self.ngrid])
+            res = self.full_residual(logc, lma=False)
             return res.flatten()
         
         def flat_objective(x):
-            logcmu = x.reshape([self.nspecies, self.ngrid])
-            res = self.gibbs_free_energy(logcmu)
+            logc = x.reshape([self.nspecies, self.ngrid])
+            res = self.gibbs_free_energy(logc)
             return res.flatten()[0]
         f_t = flat_objective
         df_t = functorch.jacrev(f_t)
@@ -384,8 +362,8 @@ class TransportBuilder(object):
     def solve_lma(self, simplified : bool = False):
         self.simplified = simplified
         def flat_residual(x):
-            logcmu = x.reshape([self.nspecies, self.ngrid])
-            res = self.full_residual(logcmu, lma=True, include_mu=False)
+            logc = x.reshape([self.nspecies, self.ngrid])
+            res = self.full_residual(logc, lma=True)
             return res.flatten()
         f = torch_wrap(flat_residual)
         jac = torch_wrap(functorch.jacrev(flat_residual))
