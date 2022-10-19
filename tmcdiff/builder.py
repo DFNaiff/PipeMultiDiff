@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from typing import Dict, List, Union, Optional, TypeVar
 
 import numpy as np
@@ -57,16 +58,25 @@ class TransportBuilder(object):
     def get_logc(self):
         logc = self.x.reshape(self.nspecies, self.ngrid)
         return logc
-
-    def set_species(self, species_to_remove : Optional[List[str]] = None):
-        if species_to_remove is not None:
-            self.species_to_remove = species_to_remove
-        self.basedict = {k: v
-                         for k, v in pyequion2.datamods.chemical_potentials.items()
-                         if k in self.eqsys.solutes
-                         and k not in self.species_to_remove}
-        self.species = [spec for spec in self.eqsys.species[1:] if spec not in self.species_to_remove]
+    
+    @property
+    def xoptim(self):
+        return self.get_logc()[self.species_optim_ind, :].flatten()
+    
+    def set_species(self, species_to_optimize : Optional[List[str]] = None):
+        # self.basedict = {k: v
+                         # for k, v in pyequion2.datamods.chemical_potentials.items()
+                         # if k in self.eqsys.solutes
+                         # and k not in self.species_to_remove}
+        self.species = [spec for spec in self.eqsys.species[1:]]
         self.species_ind = [self.eqsys.species.index(spec) for spec in self.species]
+        
+        if species_to_optimize is None:
+            self.species_to_optimize = [spec for spec in self.species]
+        else:
+            self.species_to_optimize = [spec for spec in self.species if spec in species_to_optimize]
+        self.species_optim_ind = [self.species.index(spec) for spec in self.species_to_optimize]
+        
         self.solid_ind = [self.eqsys.solid_phase_names.index(phase) for phase in self.phases]
         self.reduced_formula_matrix = self.eqsys.formula_matrix[2:, self.species_ind]
         self.reduced_stoich_matrix = self.eqsys.stoich_matrix[:, self.species_ind]
@@ -88,17 +98,18 @@ class TransportBuilder(object):
         else:
             self.kreaction_ = None
         self.nspecies = len(self.species)
+        self.nspecoptim = len(self.species_to_optimize)
         self.logk_solid = self.eqsys.get_solid_log_equilibrium_constants(self.TK)[self.solid_ind]
         
         self.reduced_standard_potentials = self.eqsys.get_standard_chemical_potentials(self.TK)[self.species_ind]
-        self.reduced_standard_potentials /= (pyequion2.constants.GAS_CONSTANT*self.TK)    
+        self.reduced_standard_potentials /= (pyequion2.constants.GAS_CONSTANT*self.TK) #unitless
         self.reduce_activity_function()
         self.reduced_diffusion_coefficients = pyequion2.equilibrium_backend.diffusion_coefficients.get_diffusion_coefficients(
-                                        self.species, self.TK)
+                                        self.species, self.TK) #m2/s
         self.reduced_diffusion_coefficients = torch.tensor(self.reduced_diffusion_coefficients,
-                                                           dtype=torch.float)
-        self.reduced_diffusion_coefficients /=self.kinematic_viscosity
-        self.mean_diffusion_coefficients = np.median(self.reduced_diffusion_coefficients)
+                                                           dtype=torch.float) #m2/s
+        self.reduced_diffusion_coefficients /=self.kinematic_viscosity #unitless
+        self.mean_diffusion_coefficients = np.median(self.reduced_diffusion_coefficients) #unitless
         self.water_reaction_index = [i for i, reac in enumerate(self.eqsys.reactions)
                                      if is_water_reaction(reac)]
         
@@ -114,12 +125,20 @@ class TransportBuilder(object):
                             self.species, backend="torch")
         
     def activity_model_func(self, molals : torch.Tensor,
-                            TK : float):
+                            TK : Optional[float] = None,
+                            numpy : bool = False):
+        if TK is None:
+            TK = self.TK
+        if numpy:
+            molals = torch.tensor(molals, dtype=torch.float)
         if self.idealized:
-            return torch.zeros_like(molals)
+            logg = torch.zeros_like(molals)
         else:
-            return self._actfunc(molals, TK)[..., 1:]/pyequion2.constants.LOG10E
-        
+            logg = self._actfunc(molals, TK)[..., 1:]/pyequion2.constants.LOG10E
+        if numpy:
+            logg = np.array(logg)
+        return logg
+    
     def make_grid(self, ngrid : int, ymax : float):
         self.ngrid = ngrid
         self.npoints = ngrid + 1
@@ -143,15 +162,10 @@ class TransportBuilder(object):
         base = base[..., None]
         return base
     
-    def transport_residual(self, logc : Optional[torch.Tensor] = None,
-                           c : Optional[torch.Tensor] = None):
+    def transport_residual(self, logc : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
-        assert (c is not None or logc is not None)
-        if c is None:
-            c = torch.exp(logc) #(nsolutes, ngrid)
-        else:
-            logc = torch.log(c)
+        c = torch.exp(logc) #(nsolutes, ngrid)
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T #(nsolutes, ngrid)
         loga = logg + logc #(nsolutes, ngrid)
         ypoints = self.ypoints #(npoints,)
@@ -188,33 +202,28 @@ class TransportBuilder(object):
         residual = torch.cat([left_residual, middle_residual, right_residual], dim=1) #(nsolutes, ngrid)
         return residual
     
-    def fluxes(self, logc : Optional[torch.Tensor] = None,
-               c : Optional[torch.Tensor] = None):
+    def fluxes(self, logc : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
-        if logc is None and c is None:
+        if logc is None:
             logc = self.get_logc()
-        assert (c is not None or logc is not None)
-        if c is None:
-            c = torch.exp(logc) #(nsolutes, ngrid)
-        else:
-            logc = torch.log(c)
+        c = torch.exp(logc) #mol/kg H2O
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T #(nsolutes, ngrid)
-        loga = logg + logc #(nsolutes, ngrid)
-        ypoints = self.ypoints #(npoints,)
+        loga = logg + logc #(nsolutes, ngrid) #unitless
+        ypoints = self.ypoints #(npoints,) #unitless
         ystep = self.ystep
-        mdiffs = self.get_reduced_diffusion_coefficients() #(nsolutes, 1)
-        tdiffs = self.wall_diffusion_plus(ypoints)[1:-1] #(ngrid-1,)
+        mdiffs = self.get_reduced_diffusion_coefficients() #(nsolutes, 1) #unitless
+        tdiffs = self.wall_diffusion_plus(ypoints)[1:-1] #(ngrid-1,) #unitless
         A = self.reduced_formula_matrix #(nels, nsolutes)
         R = self.reduced_reaction_vector #(nreac, nsolutes)
-        logKsp = self.logk_solid[..., None] #(nreac, 1)
-        cinterp = (c[:, 1:] + c[:, :-1])*0.5 #(nsolutes, ngrid-1)
-        dmu = (loga[:, 1:] - loga[:, :-1])/ystep #(nsolutes, ngrid-1)
-        dc = (c[:, 1:] - c[:, :-1])/ystep #(nsolutes, ngrid-1)
+        logKsp = self.logk_solid[..., None] #(nreac, 1) #unitless
+        cinterp = (c[:, 1:] + c[:, :-1])*0.5 #(nsolutes, ngrid-1) #mol/kg H2O
+        dmu = (loga[:, 1:] - loga[:, :-1])/ystep #(nsolutes, ngrid-1) #1/yp
+        dc = (c[:, 1:] - c[:, :-1])/ystep #(nsolutes, ngrid-1) #mol/kg H2O/yp
         if self.simplified:
-            jmiddle = -A@(mdiffs*dc + tdiffs*dc)*self.water_density #(nels, ngrid-1)
+            jmiddle = -A@(mdiffs*dc + tdiffs*dc)*self.water_density #(nels, ngrid-1) #mol/(m3*yp)
         else:
-            jmiddle = -A@(mdiffs*cinterp*dmu + tdiffs*dc)*self.water_density #(nels, ngrid-1)
+            jmiddle = -A@(mdiffs*cinterp*dmu + tdiffs*dc)*self.water_density #(nels, ngrid-1) #mol/(m3*yp)
         if self.kreaction is not None:
             logaleft = loga[:, :1]
             logsatur = R@logaleft - logKsp #(nreac, 1)
@@ -222,19 +231,14 @@ class TransportBuilder(object):
             jend = A@(R.T)@jsatur #(nels, 1)
             jfull = torch.cat([jend, jmiddle], dim=-1)
         else:
-            jfull = jmiddle
-        jfull *= self.kinematic_viscosity/self.wall_length() #mol/m3 to mol/(m2*s)
+            jfull = jmiddle #mol/m4
+        jfull /= self.wall_length() #mol/(m3*yp) to mol/m4
+        jfull *= self.kinematic_viscosity #mol/m4 to to mol/(m2*s)
         return jfull
         
     
-    def lma_residual(self, logc : torch.Tensor = None, 
-                     c : Optional[torch.Tensor] = None,
+    def lma_residual(self, logc : torch.Tensor = None,
                      only_water : bool = False):
-        assert (c is not None or logc is not None)
-        if c is None:
-            c = torch.exp(logc) #(nsolutes, ngrid)
-        else:
-            logc = torch.log(c)
         logg = self.activity_model_func(torch.exp(logc).T, self.TK).T
         loga = logg + logc
         if only_water:
@@ -249,25 +253,48 @@ class TransportBuilder(object):
     def full_residual(self, logc : Optional[torch.Tensor] = None,
                       c : Optional[torch.Tensor] = None,
                       lma : bool = True,
-                      include_water : bool = True):
+                      include_water : bool = True,
+                      optim_species : bool = False):
         #logc : (2*nsolutes, ngrid)
+        assert (c is not None or logc is not None)
+        if c is not None:
+            if optim_species:
+                c_ = torch.exp(self.get_logc())
+                c_[self.species_optim_ind, :] = c
+                c = c_
+            logc = torch.log(c) #(nsolutes, ngrid)
+        else:
+            if optim_species:
+                logc_ = self.get_logc()
+                logc_[self.species_optim_ind, :] = logc
+                logc = logc_
+            c = torch.exp(logc)
         residual_factor = 1/self.flux_residual_tol
-        res1 = self.transport_residual(logc, c) #(nels, ngrid)
+        res1 = self.transport_residual(logc) #(nels, ngrid)
         res1 *= residual_factor
         if lma or include_water:
-            res2 = self.lma_residual(logc, c, only_water=not lma)
+            res2 = self.lma_residual(logc, only_water=not lma)
             res = torch.cat([res1, res2], dim=0)
         else:
             res = res1
         return res
 
     def gibbs_free_energy(self, logc : Optional[torch.Tensor] = None,
-                          c : Optional[torch.Tensor] = None):
+                          c : Optional[torch.Tensor] = None,
+                          optim_species : bool = False):
         assert (c is not None or logc is not None)
-        if c is None:
-            c = torch.exp(logc) #(nsolutes, ngrid)
+        if c is not None:
+            if optim_species:
+                c_ = torch.exp(self.get_logc())
+                c_[self.species_optim_ind, :] = c
+                c = c_
+            logc = torch.log(c) #(nsolutes, ngrid)
         else:
-            logc = torch.log(c)
+            if optim_species:
+                logc_ = self.get_logc()
+                logc_[self.species_optim_ind, :] = logc
+                logc = logc_
+            c = torch.exp(logc)
         mu = self.chemical_potentials(logc)
         return torch.mean(torch.sum(c*mu, dim=0))
     
@@ -294,6 +321,9 @@ class TransportBuilder(object):
         self.lambd = lambd_.flatten()
         
     def set_initial_guess_lagrangian(self, method='lm'):
+        """
+            DEPRECATED
+        """
         raise NotImplementedError
         oldngrid = self.ngrid
         self.make_grid(2, self.ymax)
@@ -314,6 +344,10 @@ class TransportBuilder(object):
         
     def solve_gem_lagrangian(self, simplified : bool = False,
                              method='lm', options=None):
+        """
+            DEPRECATED
+        """
+        raise NotImplementedError
         options = dict() if options is None else options
         self.simplified = simplified
         def flat_residual(x):
