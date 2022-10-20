@@ -9,6 +9,7 @@ import pyequion2
 
 
 GenericTensor = TypeVar("GenericTensor")
+Reaction = TypeVar("Reaction")
 
 
 class TransportBuilder(object):
@@ -17,7 +18,7 @@ class TransportBuilder(object):
                  shear_velocity : float,
                  cbulk : Dict[str, float],
                  phases : List[str],
-                 kreaction : Optional[Union[float, GenericTensor]] = None,
+                 kreaction : Optional[Reaction] = None,
                  flux_residual_tol : float = 1e0):
         self.eqsys = eqsys
         self.TK = TK
@@ -88,19 +89,15 @@ class TransportBuilder(object):
                 (self.reduced_formula_matrix@(self.reduced_reaction_vector.T)).T
             ).T
         )
-        if self.kreaction == "inf":
-            self.kreaction = None
         if self.kreaction is not None:
-            self.kreaction_ = (torch.tensor(self.kreaction, dtype=torch.float)
-                               if type(self.kreaction) != torch.Tensor
-                               else self.kreaction)
-            self.kreaction_ = (torch.ones([self.nsolid])*self.kreaction)[..., None]
-        else:
-            self.kreaction_ = None
+            self.kreaction = torch.atleast_1d(torch.tensor(self.kreaction,
+                                                           dtype=torch.float))
         self.nspecies = len(self.species)
         self.nspecoptim = len(self.species_to_optimize)
         self.logk_solid = self.eqsys.get_solid_log_equilibrium_constants(self.TK)[self.solid_ind]
-        
+        self.solidiapcoef = [getiapcoef(self.eqsys.solid_reactions[i], self.species)
+                             for i in self.solid_ind]
+        self.solidiapcoef = torch.tensor(self.solidiapcoef, dtype=torch.float)
         self.reduced_standard_potentials = self.eqsys.get_standard_chemical_potentials(self.TK)[self.species_ind]
         self.reduced_standard_potentials /= (pyequion2.constants.GAS_CONSTANT*self.TK) #unitless
         self.reduce_activity_function()
@@ -162,6 +159,16 @@ class TransportBuilder(object):
         base = base[..., None]
         return base
     
+    def reaction_function(self, logsatur):
+        #linear_ksp model
+        lnksp = self.logk_solid #(nreac)
+        ksp = torch.exp(lnksp) #(mol/kgH2O)**nu
+        ksp = ksp*self.water_density**self.solidiapcoef #(mol/m3)**nu
+        #kreaction : (m3/mol)**nu*mol/m2
+        kr = self.kreaction*ksp #mol/m2
+        kr = kr[..., None]
+        return kr*torch.relu(torch.exp(logsatur)-1)
+        
     def transport_residual(self, logc : Optional[torch.Tensor] = None):
         #logc : (nsolutes, ngrid)
         #npoints = ngrid + 1
@@ -195,8 +202,9 @@ class TransportBuilder(object):
             left_residual = torch.cat([upper_left_residual, lower_left_residual], dim=0) #(nsolutes, 1)
         else:
             logsatur = R@logaleft - logKsp #(nreac, 1)
-            jsatur = -self.kreaction*torch.relu(torch.exp(logsatur) - 1) #(nreac, 1) #(mol/m3)
+            jsatur = -self.reaction_function(logsatur) #(nreac, 1) #(mol/m2 s)
             #jsatur = -self.kreaction*logsatur
+            jsatur = jsatur/self.kinematic_viscosity*self.wall_length()
             jend = A@(R.T)@jsatur #(nels, 1)
             left_residual = (jend - jleft)/ystep #(nels, 1)
         residual = torch.cat([left_residual, middle_residual, right_residual], dim=1) #(nsolutes, ngrid)
@@ -227,15 +235,15 @@ class TransportBuilder(object):
         if self.kreaction is not None:
             logaleft = loga[:, :1]
             logsatur = R@logaleft - logKsp #(nreac, 1)
-            jsatur = -self.kreaction*torch.relu(torch.exp(logsatur) - 1) #(nreac, 1) #mol/m4 #TODO: Correct unit for kreaction
-            jend = A@(R.T)@jsatur #(nels, 1)
+            jsatur = -self.reaction_function(logsatur) #(nreac, 1) #mol/(m2 s)
+            jsatur = jsatur/self.kinematic_viscosity*self.wall_length() #mol/(m2 s) to mol/(m4) to mol/(m3*yp)
+            jend = A@(R.T)@jsatur #(nels, 1) #mol/(m3*yp)
             jfull = torch.cat([jend, jmiddle], dim=-1)
         else:
             jfull = jmiddle #mol/m4
         jfull /= self.wall_length() #mol/(m3*yp) to mol/m4
         jfull *= self.kinematic_viscosity #mol/m4 to to mol/(m2*s)
         return jfull
-        
     
     def lma_residual(self, logc : torch.Tensor = None,
                      only_water : bool = False):
@@ -468,6 +476,10 @@ def torch_wrap(f):
 
 def is_water_reaction(reac):
     return 'H2O' in reac and 'OH-' in reac and 'H+' in reac
+
+
+def getiapcoef(reac, specs):
+    return sum(reac[spec] for spec in specs if spec in reac)
 
 
 @torch.jit.script

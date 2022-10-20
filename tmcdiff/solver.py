@@ -16,7 +16,8 @@ class TransportSolver(object):
                                                   backend="torch",
                                                   logbase="e",
                                                   activity_model="DEBYE")
-    
+        self.kreaction = None
+        
     def set_flow_conditions(self, TK : float,
                             flow_velocity : float,
                             pipe_diameter : float):
@@ -38,7 +39,7 @@ class TransportSolver(object):
                            self.shear_velocity,
                            self.initial_molal_balance,
                            self.solid_phases,
-                           kreaction="inf")
+                           kreaction=self.kreaction)
         self.ngrid = ngrid
         self.ypmax = ypmax
         self.builder.make_grid(ngrid, ypmax)
@@ -49,6 +50,7 @@ class TransportSolver(object):
         tarr = []
         logc = []
         xarr = []
+        fluxarr = []
         y = np.array([self.initial_molal_balance[el] for el
                       in self.builder.eqsys.solute_elements])
         solver = scipy.integrate.ode(self.f)
@@ -60,9 +62,11 @@ class TransportSolver(object):
         counter = 0
         while solver.successful():
             solver.integrate(tmax, step=True)
+            fluxes = self.builder.fluxes().detach().numpy()[:-1, -1]
             xarr.append(solver.y)
             tarr.append(solver.t)
             logc.append(self.builder.get_logc().numpy())
+            fluxarr.append(fluxes)
             if solver.t > tmax:
                 break
             counter += 1
@@ -71,6 +75,7 @@ class TransportSolver(object):
         self.x = np.stack(xarr, axis=0)
         self.t = np.array(tarr)
         self.logc = np.stack(logc, axis=0)
+        self.fluxes = np.stack(fluxarr, axis=0)
         
     def set_initial_guess(self):
         self.builder.set_initial_guess_from_bulk()
@@ -94,9 +99,11 @@ class TransportSolver(object):
             self.x = f["x"]
             self.t = f["t"]
             self.logc = f["logc"]
+            self.fluxes = f["fluxes"]
     
     def save(self, filename : str):
-        np.savez(filename, t=self.t, x=self.x, logc=self.logc)
+        np.savez(filename, t=self.t, x=self.x,
+                 logc=self.logc, fluxes=self.fluxes)
 
 
 def reynolds_number(flow_velocity : float,
